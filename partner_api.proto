@@ -1,0 +1,210 @@
+syntax = "proto3";            
+
+package protos;
+
+option java_multiple_files = true;
+option java_package = "com.emporiaenergy.protos.partnerapi";
+option java_outer_classname = "PartnerApiProto";
+
+// The methods available from the Emporia Energy Partner API.  The Emporia API is available via gRPC at 
+//   URL:  partner-api.emporiaenergy.com 
+//   PORT: 50051
+service PartnerApi
+{
+    // login with the email and password you use on the portal website and get back an auth_token
+    rpc Authenticate( AuthenticationRequest ) returns ( AuthenticationResponse );
+    
+    // get the collection of devices associated to your partner account, 
+    // optionally limited to devices related to one or more customer emails
+    rpc GetDevices( DeviceInventoryRequest ) returns ( DeviceInventoryResponse );
+    
+    // get usage data for one or more devices
+    rpc GetUsageData( DeviceUsageRequest ) returns ( DeviceUsageResponse );
+    
+    // determine if one or more Outlets are currently on
+    rpc GetOutletStatus( DeviceListRequest ) returns ( OutletStatusResponse );
+    
+    // set one or more Outlets to be on or off.  
+    // only the outlets that were changed will be included in the OutletStatusResponse; outlets that
+    // aren't connected to the cloud or were already in the requested state won't be included
+    rpc SetOutletStatus( OutletStatusRequest ) returns ( OutletStatusResponse );
+}
+
+// All API access is controlled using authorization tokens.  You should use the same email and password used to 
+// access the Emporia Partner Portal to access the API.  
+message AuthenticationRequest
+{
+    // partner email from the partner portal website 
+    string partner_email = 1;
+    // password the partner uses to login to the partner portal website
+    string password = 2;
+}
+
+// Responses from the API include a status.  If you get back AUTH_EXPIRED you need to call Authenticate again.  
+// calling the API with invalid credentials will result in a gRPC error   
+enum ResultStatus
+{
+    VALID = 0;
+    AUTH_EXPIRED = 3;
+    
+    // these are now reported as gRPC errors
+    AUTH_INVALID_CREDENTIALS = 1 [deprecated=true];
+    AUTH_INVALID_TOKEN = 2 [deprecated=true];
+    INVALID_USAGE_SCALE = 4 [deprecated=true];
+    INTERNAL_ERROR = 100 [deprecated=true];
+}
+
+message AuthenticationResponse
+{
+    // the authorization token that you need to include with all other calls to the API
+    string auth_token = 1;
+    ResultStatus result_status = 100;
+}
+
+// request information on the devices associated to the partner
+message DeviceInventoryRequest
+{
+    string auth_token = 1;
+    // If empty, return all devices associated with partner
+    // if not empty, return all the devices associated to the partner AND to the specified customer email(s) 
+    repeated string customer_emails = 2;
+}
+
+// returns some or all of the devices associated with the partner
+message DeviceInventoryResponse
+{
+    // list of devices associated with the partner
+    repeated Device devices = 1;
+
+    // Some Devices may contain fields that are not set. 
+    message Device
+    { 
+        // identifies this device on future requests such as building DeviceUsageRequest
+        string manufacturer_device_id = 1;
+        string model = 2;
+        string firmware = 3;
+        // the time when the user last logged into the Emporia mobile app
+        string last_app_connect_time = 4;
+        // indicates if the device is monitoring a house with solar or generation
+        bool solar = 5;
+        double latitude = 6;
+        double longitude = 7;
+        // name of the device as chosen by the customer
+        string device_name = 8;
+        // some Partners are not allowed to see customer information so this list will be empty
+        // there might also not be a customer associated to this device
+        // or there might be several customers associated, which is why this is a repeated field
+        repeated CustomerInfo customer_info = 9;
+        // name of the channels as chosen by the customer
+        repeated string channel_names = 10;
+        // is this device currently connected to the Emporia cloud.
+        bool device_connected = 11;
+        // if this device is a Utility Connect (connects to an AMI Smart Meter over Zigbee), 
+        // this will be the MAC of the Zigbee radio.  Otherwise this will be empty.  
+        string zigbee_mac = 12;
+
+        message CustomerInfo
+        {
+            string first_name = 1;
+            string last_name = 2;
+            string email = 3;
+        }
+    }
+
+    ResultStatus result_status = 100;
+}
+
+// Specifies which data channels to fetch, see the DeviceUsageResponse message for more details
+enum UsageChannel
+{
+    MAINS = 0;		// the Main channels, will be 1 channel for Plugs, Zigbees and EVSEs and up to 3 channels for Vue1s and Vue2s
+    ALL = 1;		// requests usage data for all channels, could be up to 19 channels for a Vue2 (3 mains and 16 50A CTs)
+}
+
+// Get historical usage for the specified time range and scale
+// Usage is returned for each of the specified devices, allowing usage data to be queried 
+// for a single device or group of devices in a single call. 
+message DeviceUsageRequest
+{
+    string auth_token = 1;
+
+    // start and end are specified as seconds since epoch (January 1, 1970) in the UTC timezone.
+    uint64 start_epoch_seconds = 2;
+    uint64 end_epoch_seconds = 3;
+    // What resolution data should be fetched?  Historical data is returned in buckets with the 
+    // requested scale, e.g., the 15MIN scale returns buckets representing 15 minutes of energy usage
+    string scale = 4;		// Allowable values: 1MIN, 15MIN, 1H, 1D, 1W, 1MON, 1Y
+
+    // which channels of data should be fetched?
+    UsageChannel channels = 5;
+
+    // list of device ids, this must be populated or the response will be empty
+    repeated string manufacturer_device_id = 6;
+}
+
+// Emporia produces a range of devices that vary in the data they measure.
+// Outlets, EVChargers and UtilityConnects (Zigbees) devices have only one circuit: #1
+// Vue and Vue2 monitors have up to 3 200amp CTs, reporting on circuits 1, 2 and 3.  The app sums the usage
+// for those circuits and displays it as Mains.  These devices may also have up to 16 50amp CTs which are
+// reported on circuits 4-19.  
+message DeviceUsageResponse
+{
+    repeated DeviceUsage device_usage = 1;
+
+    // represents usage for a single Emporia device
+    message DeviceUsage
+    {
+        string manufacturer_device_id = 1;
+        // echos back the requested scale
+        string scale = 2;
+        // the Instant of the energy usage data
+        repeated uint64 bucket_epoch_seconds = 3;
+        // for devices with multiple channels, each channel will be its own item
+        repeated ChannelUsageData channel_usage = 4;
+        
+        // The usage is energy consumed over the bucket in watt-hours.  So a 100 watt load over a one hour bucket 
+        // will report 100 watt-hours, while the same 100 watt load over a minute bucket will report 1.666 watt-hours (100/60).
+        message ChannelUsageData
+        {
+            // the channel that the data is for
+            uint32 channel = 1;
+            // the usage in watt-hours, see the above comment for scales shorter than one hour
+            repeated double usage = 2;
+        }
+    }
+
+    ResultStatus result_status = 100;
+}
+
+// Query current outlet state for one or more partner outlet devices. 
+// Device IDs are specified in query command, allowing state to be queried for multiple outlets in a single call.  
+message DeviceListRequest
+{
+    string auth_token = 1;
+    // list of device ids, this must be populated or the response will be empty
+    repeated string manufacturer_device_id = 2;
+}
+
+// Response describing the On/Off status of an Emporia Outlet.  
+// If device_connected for an Outlet is false, the On/Off status may be out of date
+message OutletStatusResponse
+{
+    repeated OutletStatus outlet_status = 1;
+    ResultStatus result_status = 100;
+}
+
+// Represents the On/Off status of a single Emporia Outlet.  This is used both in the response from 
+// the API describing the current state and in the SetOutletStatus method to turn an Outlet on or off.
+message OutletStatus
+{
+    string manufacturer_device_id = 1;
+    bool on = 2;
+}
+
+// Used by the SetOutletStatus method to turn an Outlet on or off
+message OutletStatusRequest
+{
+    string auth_token = 1;
+    // should the outlet be set to on or off?
+    repeated OutletStatus outlet_status = 2;
+}
